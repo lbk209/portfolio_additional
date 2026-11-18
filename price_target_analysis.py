@@ -44,10 +44,55 @@ BACKTEST_METHODS = ("normal", "empirical", "bootstrap", "conditional_empirical")
 _DEFAULT_MODEL = object()
 
 
+def _price_types(price_type: str | Sequence[str]) -> tuple[tuple[str, ...], bool]:
+    """Validate one price type or a sequence; report whether input was plural."""
+    multiple = not isinstance(price_type, str)
+    types = tuple(price_type) if multiple and isinstance(price_type, (list, tuple)) else (
+        (price_type,) if isinstance(price_type, str) else ()
+    )
+    if not types or len(set(types)) != len(types) or any(
+        not isinstance(p, str) or p not in ("terminal", "min", "max") for p in types
+    ):
+        raise ValueError("price_type must be 'terminal', 'min', 'max' or a nonempty list of these")
+    return types, multiple
+
+
+def _numeric_variants(values, *, arg_name: str, label, minimum: int) -> dict[str, int]:
+    """Normalize integer, list/tuple, or named dict of integer configurations."""
+    if isinstance(values, dict):
+        if not values:
+            raise ValueError(f"{arg_name} cannot be empty")
+        pairs = list(values.items())
+    elif isinstance(values, (int, np.integer)) and not isinstance(values, (bool, np.bool_)):
+        pairs = [(label(int(values)), values)]
+    elif isinstance(values, (list, tuple)):
+        if not values:
+            raise ValueError(f"{arg_name} cannot be empty")
+        pairs = [(label(value), value) for value in values]
+    else:
+        raise TypeError(f"{arg_name} must be an integer, a list, or a dict")
+    normalized = {}
+    used = set()
+    for name, value in pairs:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{arg_name} variant names must be nonempty strings")
+        if (not isinstance(value, (int, np.integer))
+                or isinstance(value, (bool, np.bool_)) or value < minimum):
+            raise ValueError(f"{arg_name} must contain integers >= {minimum}")
+        value = int(value)
+        if value in used:
+            raise ValueError(f"{arg_name} contains a duplicate configuration: {value}")
+        normalized[name] = value
+        used.add(value)
+    return normalized
+
+
 def _validated_probabilities(probabilities: Sequence[float]) -> np.ndarray:
     """Check finite, unique quantile levels within [0, 1]."""
+    if isinstance(probabilities, (bool, np.bool_)):
+        raise ValueError("probabilities must be numeric, not boolean")
     try:
-        arr = np.asarray(probabilities, dtype=float)
+        arr = np.atleast_1d(np.asarray(probabilities, dtype=float))
     except (TypeError, ValueError) as exc:
         raise ValueError("probabilities must be a sequence of finite numbers") from exc
     if arr.ndim != 1 or len(arr) == 0 or not np.isfinite(arr).all():
@@ -89,8 +134,10 @@ def _validated_thresholds(thresholds: Sequence[float], *, pct: bool, mode: str) 
         raise ValueError("pct must be a boolean")
     if mode not in ("above", "below", "mixed"):
         raise ValueError("mode must be 'above', 'below', or 'mixed'")
+    if isinstance(thresholds, (bool, np.bool_)):
+        raise ValueError("thresholds must be numeric, not boolean")
     try:
-        arr = np.asarray(thresholds, dtype=float)
+        arr = np.atleast_1d(np.asarray(thresholds, dtype=float))
     except (TypeError, ValueError) as exc:
         raise ValueError("thresholds must be a sequence of finite numbers") from exc
     if arr.ndim != 1 or len(arr) == 0 or not np.isfinite(arr).all():
@@ -396,40 +443,21 @@ class ModelResults:
         return pd.DataFrame(records).set_index("variant")
 
     def threshold_probabilities(
-        self, *, thresholds: Sequence[float], pct: bool = True,
-        mode: str = "mixed", price_type: str = "terminal",
+        self, *, thresholds: float | Sequence[float], pct: bool = True,
+        mode: str = "mixed", price_type: str | Sequence[str] = "terminal",
         horizon_days: Optional[int] = None, variant: Optional[str] = None,
-        styled: bool = True, summary=True
+        styled: bool = True, summary: bool = True,
     ) -> pd.DataFrame | Styler:
-        """Probability of exceeding/falling below each threshold, in percent.
+        """Threshold event frequencies for terminal/min/max future closes.
 
-        Each path contributes one value: the close at horizon (terminal), or
-        its lowest/highest FUTURE daily close through that horizon (min/max).
-        The known starting close is excluded. These are not disjoint bins:
-        columns may overlap, and need not sum to 100%.
-
-        pct=True: thresholds are changes in percentage points; 10 means +10%.
-        pct=False: thresholds are actual positive prices/index levels.
-        mode='above': value >= threshold; mode='below': value < threshold.
-        mode='mixed': below for negative returns / prices below reference;
-        above for zero-or-positive returns / prices at or above reference.
-        The strict-below vs inclusive-above rule partitions equality exactly.
-
-        For min/below or max/above, the result is a daily-close barrier-event
-        probability; it does not imply an intraday touch. All methods use the
-        same event definitions without resimulating paths.
-
-        For Normal's zero-log-drift baseline, compare one fixed loss threshold
-        across lookback variants (e.g. the <-10% column). Contrasting <-10%
-        with >=+10% does not measure a directional market edge: their near-
-        similarity is largely imposed by the model. For all methods, reported
-        percentages are conditional on the method's assumptions and sample.
+        thresholds accepts one number or a list. price_type accepts one
+        string or a list of strings; a list produces a (variant, price_type)
+        MultiIndex. The starting close is excluded from future events.
         """
         arr = _validated_thresholds(thresholds, pct=pct, mode=mode)
         if not isinstance(styled, (bool, np.bool_)):
             raise ValueError("styled must be a boolean")
-        if price_type not in ("terminal", "min", "max"):
-            raise ValueError("price_type must be 'terminal', 'min', or 'max'")
+        types, multiple = _price_types(price_type)
         if horizon_days is not None and (
             not isinstance(horizon_days, (int, np.integer))
             or isinstance(horizon_days, (bool, np.bool_))
@@ -438,14 +466,12 @@ class ModelResults:
             raise ValueError("horizon_days must be an integer between 1 and H")
         if variant is not None and variant not in self.variants:
             raise ValueError(f"Unknown variant: {variant}")
-
         reference = float(self.reference_price)
         levels = [_threshold_level(float(t), reference=reference, pct=pct) for t in arr]
         above = [
             _threshold_is_above(float(t), reference=reference, pct=pct, mode=mode)
             for t in arr
         ]
-
         def formatted(t: float) -> str:
             if pct:
                 value = f"{t:+g}%" if t != 0 else "0%"
@@ -453,61 +479,55 @@ class ModelResults:
                 value = f"{t:,.15g}"
             return ("≥" if _threshold_is_above(t, reference=reference, pct=pct, mode=mode)
                     else "<") + value
-
         names = [formatted(float(t)) for t in arr]
         selected = ({variant: self.variants[variant]}
                     if variant is not None else self.variants)
         rows = {}
         for key, item in selected.items():
-            if item.status != "ok" or item.n_paths == 0:
-                rows[key] = np.full(len(arr), np.nan)
-                continue
-            values = item._path_values(price_type, horizon_days=horizon_days)
-            rows[key] = [
-                100.0 * np.mean(_threshold_event(values, level=level, above=is_above))
-                for level, is_above in zip(levels, above)
-            ]
+            for pt in types:
+                row_key = (key, pt) if multiple else key
+                if item.status != "ok" or item.n_paths == 0:
+                    rows[row_key] = np.full(len(arr), np.nan)
+                    continue
+                values = item._path_values(pt, horizon_days=horizon_days)
+                rows[row_key] = [
+                    100.0 * np.mean(_threshold_event(values, level=level, above=is_above))
+                    for level, is_above in zip(levels, above)
+                ]
         result = pd.DataFrame.from_dict(rows, orient="index", columns=names)
-        result.index.name = "variant"
-        
+        if multiple:
+            result.index = pd.MultiIndex.from_tuples(
+                result.index, names=["variant", "price_type"]
+            )
+        else:
+            result.index.name = "variant"
         if summary:
             self.summary(short=True)
-            
         if styled:
             return (result.style
                     .format("{:.1f}%", na_rep="—")
                     .background_gradient(cmap="Blues", vmin=0, vmax=100, axis=None))
         return result
 
-
-
-
-
     def return_quantiles(
-        self, *, probabilities: Sequence[float], pct: bool = True,
-        price_type: str = "terminal", horizon_days: Optional[int] = None,
-        variant: Optional[str] = None, styled: bool = True, summary: bool = True,
+        self, *, probabilities: float | Sequence[float], pct: bool = True,
+        price_type: str | Sequence[str] = "terminal",
+        horizon_days: Optional[int] = None, variant: Optional[str] = None,
+        styled: bool = True, summary: bool = True,
     ) -> pd.DataFrame | Styler:
-        """Return empirical/simulated quantiles of path prices or price returns.
+        """Quantiles of terminal/min/max future closes or arithmetic returns.
 
-        Complements threshold_probabilities(): it fixes cumulative levels
-        and returns the corresponding outcomes rather than fixing outcomes
-        and counting threshold events. Quantiles are NOT confidence levels.
-        For example, p90 is the return at or below which about 90% of the
-        sampled paths lie, and not a 90% probability of exceeding that return.
-
-        pct=True gives arithmetic returns in percent relative to reference
-        close; pct=False gives actual closing prices. price_type selects the
-        H-th future close, or the min/max future close through that horizon.
-        The known as-of close is excluded. No paths are regenerated.
+        probabilities accepts one number or a list. price_type accepts one
+        string or a list of strings; the latter produces a
+        (variant, price_type) MultiIndex. Quantiles are cumulative levels,
+        not probabilities of exceeding the returned value.
         """
         levels = _validated_probabilities(probabilities)
         if not isinstance(pct, (bool, np.bool_)):
             raise ValueError("pct must be a boolean")
         if not isinstance(styled, (bool, np.bool_)):
             raise ValueError("styled must be a boolean")
-        if price_type not in ("terminal", "min", "max"):
-            raise ValueError("price_type must be 'terminal', 'min', or 'max'")
+        types, multiple = _price_types(price_type)
         if horizon_days is not None and (
             not isinstance(horizon_days, (int, np.integer))
             or isinstance(horizon_days, (bool, np.bool_))
@@ -516,21 +536,26 @@ class ModelResults:
             raise ValueError("horizon_days must be an integer between 1 and H")
         if variant is not None and variant not in self.variants:
             raise ValueError(f"Unknown variant: {variant}")
-        selected = (
-            {variant: self.variants[variant]} if variant is not None
-            else self.variants
-        )
+        selected = ({variant: self.variants[variant]}
+                    if variant is not None else self.variants)
         rows = {}
         for key, item in selected.items():
-            if item.status != "ok" or item.n_paths == 0:
-                rows[key] = np.full(len(levels), np.nan)
-                continue
-            values = item._path_values(price_type, horizon_days=horizon_days)
-            if pct:
-                values = 100.0 * (values / self.reference_price - 1.0)
-            rows[key] = np.quantile(values, levels)
+            for pt in types:
+                row_key = (key, pt) if multiple else key
+                if item.status != "ok" or item.n_paths == 0:
+                    rows[row_key] = np.full(len(levels), np.nan)
+                    continue
+                values = item._path_values(pt, horizon_days=horizon_days)
+                if pct:
+                    values = 100.0 * (values / self.reference_price - 1.0)
+                rows[row_key] = np.quantile(values, levels)
         frame = pd.DataFrame.from_dict(rows, orient="index", columns=levels)
-        frame.index.name = "variant"
+        if multiple:
+            frame.index = pd.MultiIndex.from_tuples(
+                frame.index, names=["variant", "price_type"]
+            )
+        else:
+            frame.index.name = "variant"
         if summary:
             self.summary(short=True)
         return _quantiles_style(frame, pct=pct) if styled else frame
@@ -544,6 +569,8 @@ class ModelResults:
 
         Decline: first FUTURE close <= reference*(1-decline_pct/100).
         Recovery: a LATER future close >= reference*(1+recovery_pct/100).
+        recovery_pct may be negative but must exceed -decline_pct;
+        e.g. decline_pct=20 and recovery_pct=-10 means recovery to -10%.
         Both thresholds are inclusive (within machine ULP rounding).
         Decline frequency uses all valid paths; recovery frequency uses only
         paths that first declined. Median recovery days uses only recovered
@@ -558,8 +585,8 @@ class ModelResults:
                 raise ValueError(f"{name} must be a finite number")
         if not 0 < decline_pct < 100:
             raise ValueError("decline_pct must be strictly between 0 and 100")
-        if recovery_pct < 0:
-            raise ValueError("recovery_pct must be nonnegative")
+        if recovery_pct <= -decline_pct:
+            raise ValueError("recovery_pct must be greater than -decline_pct")
         if not isinstance(styled, (bool, np.bool_)):
             raise ValueError("styled must be a boolean")
         h = self.horizon_days if horizon_days is None else horizon_days
@@ -653,7 +680,9 @@ class ModelResults:
                 or isinstance(probability, (bool, np.bool_))
                 or not np.isfinite(probability) or not 0 < probability < 1):
             raise ValueError("probability must be finite and strictly between 0 and 1")
-        hs = (self.horizon_days,) if horizons is None else tuple(horizons)
+        hs = (self.horizon_days,) if horizons is None else (
+            (horizons,) if isinstance(horizons, (int, np.integer)) else tuple(horizons)
+        )
         if (not hs or any(not isinstance(h, (int, np.integer))
                           or isinstance(h, (bool, np.bool_))
                           or h < 1 or h > self.horizon_days for h in hs)):
@@ -1254,48 +1283,29 @@ class PriceTargetAnalysis:
                             self.horizon_days)
 
     def normal(
-        self, *, lookback_days: Sequence[int] = (20, 60, 120),
+        self, *, lookback_days: int | Sequence[int] | dict[str, int] = (20, 60, 120),
         simulations: int = 20_000, random_seed: int = 42,
     ) -> ModelResults:
-        """Zero-log-drift IID Gaussian baseline for volatility sensitivity.
+        """Zero-log-drift IID Gaussian baseline; lookback_days defines variants.
 
-        Estimate daily realized log-return volatility for each lookback, hold
-        it constant over H future days, and reuse identical random shocks
-        across variants. The *comparison* is the effect of different volatility
-        estimates on a fixed risk measure, e.g. P(terminal return < -10%) or
-        the lower boundary of a 90% whole-path extreme_range(). Lookbacks are
-        overlapping estimates, not independent confirmations or forecasts.
-
-        Expected LOG drift is fixed at zero, not estimated from recent returns.
-        This is neither a directional forecast nor a mean-reversion model.
-        For positive volatility, the theoretical terminal P(return >= 0%) is
-        50% for every lookback. Similarly sized probabilities at -10% and +10%
-        reflect the assumed approximately symmetric *log-return* distribution;
-        they are not evidence of balanced market upside/downside prospects.
-        Price returns and whole-path price bounds are not exactly symmetric
-        because log returns are exponentiated into positive prices.
-
-        The zero-drift choice deliberately avoids an unvalidated expected-
-        return assumption. It does NOT imply zero expected *arithmetic* return.
-        This simple, model-conditional baseline does not establish real-world
-        tail frequencies. Compare other methods carefully: their return drift
-        and sampling assumptions may differ. Expected Shortfall and conditional
-        recovery are not calculated here; they may be added separately.
+        Accept an integer, a list of integers, or a name-to-integer dict.
+        All variants reuse the same random shocks. They represent volatility
+        lookback sensitivity, not independent market forecasts.
         """
         _validate_simulations(simulations)
+        specs = _numeric_variants(
+            lookback_days, arg_name="lookback_days", label=lambda v: f"{v}d_vol", minimum=2
+        )
         variants = {}
         available = self.log_returns.dropna()
         normal_shocks = np.random.default_rng(random_seed).standard_normal(
             size=(simulations, self.horizon_days)
         )
-        for lb in lookback_days:
-            if (not isinstance(lb, (int, np.integer))
-                    or isinstance(lb, (bool, np.bool_)) or lb < 2):
-                raise ValueError("lookback_days must contain integers >= 2")
-            key = f"{lb}d_vol"
+        for key, lb in specs.items():
             if len(available) < lb:
                 variants[key] = self._empty(
-                    key, f"Need {lb} returns; only {len(available)} available"
+                    key, f"Need {lb} returns; only {len(available)} available",
+                    lookback_days=lb,
                 )
                 continue
             sigma_daily = float(available.iloc[-lb:].std(ddof=1))
@@ -1304,102 +1314,143 @@ class PriceTargetAnalysis:
             variants[key] = PathSample(
                 key, self.reference_price, self.horizon_days, paths,
                 details={
-                    "lookback_days": int(lb),
+                    "lookback_days": lb,
                     "annualized_volatility": sigma_daily * np.sqrt(TRADING_DAYS_PER_YEAR),
                     "annual_log_drift": 0.0,
                     "simulations": simulations,
                 },
             )
-        if not variants:
-            raise ValueError("lookback_days cannot be empty")
         return self._results("Normal", variants)
 
+    def _history_date(self, history_start: Optional[str]) -> pd.Timestamp:
+        """None means the earliest close in the as-of-truncated input data."""
+        return self.close.index[0] if history_start is None else pd.Timestamp(history_start)
 
-    def _historical_windows(self, *, history_start: str, sampling_step: int,
-                            min_samples: int) -> tuple[np.ndarray, pd.DatetimeIndex, dict]:
-        if sampling_step < 1 or min_samples < 1:
-            raise ValueError("sampling_step and min_samples must be >=1")
+    def _historical_windows(
+        self, *, history_start: Optional[str], sampling_step: int,
+        min_samples: int,
+    ) -> tuple[np.ndarray, pd.DatetimeIndex, dict]:
+        """Complete historical paths starting at or after the effective date."""
+        if (not isinstance(sampling_step, (int, np.integer))
+                or isinstance(sampling_step, (bool, np.bool_)) or sampling_step < 1
+                or min_samples < 1):
+            raise ValueError("sampling_step and min_samples must be positive integers")
         close = self.close.to_numpy(dtype=float)
         dates = self.close.index
-        # Every end date must be <= as_of_date, preventing any look-ahead.
+        start_date = self._history_date(history_start)
         latest_start = len(close) - self.horizon_days - 1
-        start_index = int(dates.searchsorted(pd.Timestamp(history_start)))
+        start_index = int(dates.searchsorted(start_date))
         candidate = np.arange(start_index, latest_start + 1, sampling_step, dtype=int)
+        details = {
+            "history_start": str(start_date.date()),
+            "available_paths": len(candidate),
+            "min_samples": min_samples,
+            "sampling_step": int(sampling_step),
+            "first_start": str(dates[candidate[0]].date()) if len(candidate) else None,
+            "last_start": str(dates[candidate[-1]].date()) if len(candidate) else None,
+        }
         if len(candidate) == 0:
-            return np.empty((0, self.horizon_days)), pd.DatetimeIndex([]), {
-                "available_paths": 0, "min_samples": min_samples}
-        # Include reference date in denominator only, never in returned future paths.
+            return np.empty((0, self.horizon_days)), pd.DatetimeIndex([]), details
         offsets = np.arange(1, self.horizon_days + 1)
         paths = self.reference_price * close[candidate[:, None] + offsets] / close[candidate, None]
-        return paths, dates[candidate], {"available_paths": len(candidate),
-                                        "min_samples": min_samples,
-                                        "first_start": str(dates[candidate[0]].date()),
-                                        "last_start": str(dates[candidate[-1]].date()),
-                                        "sampling_step": sampling_step}
+        return paths, dates[candidate], details
 
-    def empirical(self, *, history_start: str = "2010-01-01", sampling_step: int = 1,
-                  min_samples: int = 30, min_history_days: int = 252) -> ModelResults:
-        """Observed, normalized historical forward H-day price paths."""
+    def empirical(
+        self, *, history_start: Optional[str] = None,
+        sampling_step: int | Sequence[int] | dict[str, int] = 1,
+        min_samples: int = 30, min_history_days: int = 252,
+    ) -> ModelResults:
+        """Observed normalized historical paths; sampling_step defines variants.
+
+        Integer -> one named variant; list -> multiple automatically named
+        variants; dict -> multiple custom-named variants. Sampling steps are
+        observation counts, not calendar days.
+        """
         if min_history_days < 2:
             raise ValueError("min_history_days must be >=2")
-        paths, dates, details = self._historical_windows(
-            history_start=history_start, sampling_step=sampling_step, min_samples=min_samples)
-        key = "historical"
-        available_days = int((self.close.index >= pd.Timestamp(history_start)).sum())
-        details.update({"available_history_days": available_days, "min_history_days": min_history_days})
-        if available_days < min_history_days:
-            item = self._empty(key, f"Need {min_history_days} days of history, got {available_days}", **details)
-        elif len(paths) < min_samples:
-            item = self._empty(key, f"Need {min_samples} historical paths, got {len(paths)}", **details)
-        else:
-            item = PathSample(key, self.reference_price, self.horizon_days, paths,
-                              details=details, start_dates=dates)
-        return self._results("Empirical", {key: item})
+        specs = _numeric_variants(
+            sampling_step, arg_name="sampling_step", label=lambda v: f"step_{v}", minimum=1
+        )
+        start_date = self._history_date(history_start)
+        available_days = int((self.close.index >= start_date).sum())
+        variants = {}
+        for key, step in specs.items():
+            paths, dates, details = self._historical_windows(
+                history_start=history_start, sampling_step=step, min_samples=min_samples
+            )
+            details.update({
+                "available_history_days": available_days,
+                "min_history_days": min_history_days,
+            })
+            if available_days < min_history_days:
+                variants[key] = self._empty(
+                    key, f"Need {min_history_days} days of history, got {available_days}", **details
+                )
+            elif len(paths) < min_samples:
+                variants[key] = self._empty(
+                    key, f"Need {min_samples} historical paths, got {len(paths)}", **details
+                )
+            else:
+                variants[key] = PathSample(
+                    key, self.reference_price, self.horizon_days,
+                    paths, details=details, start_dates=dates,
+                )
+        return self._results("Empirical", variants)
 
-    def bootstrap(self, *, history_start: str = "2015-01-01",
-                  block_sizes: Sequence[int] = (1, 5, 10, 20),
-                  simulations: int = 20_000, random_seed: int = 42,
-                  drift_adjustment: str = "none", min_history_returns: int = 252) -> ModelResults:
-        """Overlapping moving-block bootstrap. block_size=1 is IID bootstrap.
+    def bootstrap(
+        self, *, history_start: Optional[str] = None,
+        block_sizes: int | Sequence[int] | dict[str, int] = (1, 5, 10, 20),
+        simulations: int = 20_000, random_seed: int = 42,
+        drift_adjustment: str = "none", min_history_returns: int = 252,
+    ) -> ModelResults:
+        """Moving-block bootstrap; block_sizes defines variants.
 
-        Blocks of contiguous *log returns* are sampled independently with
-        replacement. 'zero' subtracts the sample mean log return; 'none' keeps
-        its historical sample mean. The last partial block is truncated.
+        Accept an integer, a list of integers, or a name-to-integer dict.
+        block_size=1 is IID bootstrap. With 'zero', subtract the mean log
+        return; 'none' retains the sample mean. Partial last block is trimmed.
         """
         _validate_simulations(simulations)
         if min_history_returns < 2:
             raise ValueError("min_history_returns must be >=2")
         if drift_adjustment not in ("none", "zero"):
             raise ValueError("drift_adjustment must be 'none' or 'zero'")
-        history = self.log_returns.loc[self.log_returns.index >= pd.Timestamp(history_start)].dropna()
+        specs = _numeric_variants(
+            block_sizes, arg_name="block_sizes", label=lambda v: f"block_{v}", minimum=1
+        )
+        start_date = self._history_date(history_start)
+        history = self.log_returns.loc[self.log_returns.index >= start_date].dropna()
         arr = history.to_numpy(dtype=float)
         if drift_adjustment == "zero" and len(arr):
             arr = arr - arr.mean()
         variants = {}
-        for bs in block_sizes:
-            if not isinstance(bs, (int, np.integer)) or bs < 1:
-                raise ValueError("block_sizes must contain positive integers")
-            key = f"block_{bs}"
-            details = {"block_size": int(bs), "history_returns": len(arr),
-                       "history_start": history_start, "drift_adjustment": drift_adjustment,
-                       "simulations": simulations}
+        for key, bs in specs.items():
+            details = {
+                "block_size": bs,
+                "history_returns": len(arr),
+                "history_start": str(start_date.date()),
+                "first_return_date": str(history.index[0].date()) if len(history) else None,
+                "last_return_date": str(history.index[-1].date()) if len(history) else None,
+                "drift_adjustment": drift_adjustment,
+                "simulations": simulations,
+            }
             if len(arr) < max(min_history_returns, bs):
-                variants[key] = self._empty(key, f"Need at least {max(min_history_returns, bs)} returns; got {len(arr)}", **details)
+                variants[key] = self._empty(
+                    key, f"Need at least {max(min_history_returns, bs)} returns; got {len(arr)}", **details
+                )
                 continue
-            rng = np.random.default_rng(np.random.SeedSequence([int(random_seed), int(bs)]))
+            rng = np.random.default_rng(np.random.SeedSequence([int(random_seed), bs]))
             block_count = (self.horizon_days + bs - 1) // bs
             starts = rng.integers(0, len(arr) - bs + 1, size=(simulations, block_count))
-            # Identical kernel for bs=1 and all longer blocks.
-            indices = (starts[:, :, None] + np.arange(bs)).reshape(simulations, -1)[:, :self.horizon_days]
+            indices = (starts[:, :, None] + np.arange(bs)).reshape(
+                simulations, -1
+            )[:, :self.horizon_days]
             increments = arr[indices]
             paths = self.reference_price * np.exp(np.cumsum(increments, axis=1))
-            variants[key] = PathSample(key, self.reference_price, self.horizon_days,
-                                       paths, details=details)
-        if not variants:
-            raise ValueError("block_sizes cannot be empty")
+            variants[key] = PathSample(
+                key, self.reference_price, self.horizon_days, paths, details=details,
+            )
         return self._results("Bootstrap", variants)
 
-    # Add new indicator methods here or in a subclass; no edits to the engine.
     def indicator_volatility(self, window: int) -> pd.Series:
         """Annualized sample stdev of the latest `window` daily log returns."""
         return self.log_returns.rolling(window, min_periods=window).std(ddof=1) * np.sqrt(252)
@@ -1432,9 +1483,10 @@ class PriceTargetAnalysis:
 
 
     def conditional_empirical(
-        self, *, history_start: str = "2010-01-01",
-        variants: Optional[
-            Sequence[Criterion] | dict[str, Sequence[Criterion]]
+        self, *, history_start: Optional[str] = None,
+        criteria: Optional[
+            Criterion | Sequence[Criterion] |
+            dict[str, Criterion | Sequence[Criterion]]
         ] = None,
         sampling_step: int = 1,
         min_samples: int = 30,
@@ -1442,195 +1494,141 @@ class PriceTargetAnalysis:
         min_distinct_episodes: int = 2,
         episode_gap_days: int = 5,
     ) -> ModelResults:
-        """Condition historical H-day paths on price-state indicators.
+        """Condition historical forward paths on trailing price-state criteria.
 
-        variants accepts a list of criteria for one variant named 'matched',
-        or a dictionary mapping variant names to lists of criteria.
-        Within each variant, all criteria are combined using logical AND.
-        Variants are evaluated independently.
-
-        AsOfCriterion compares against the indicator at as_of_date;
-        FixedValueCriterion compares against a specified numeric value.
-        Only information available at each historical start is used.
-        Relative tolerance is the default; within+relative with a zero
-        reference raises ValueError (use absolute instead).
-
-        Episode counts are heuristic; overlapping paths remain dependent.
+        A single Criterion or list/tuple of ANDed criteria creates the one
+        'matched' variant. A dict maps variant names to a Criterion or ANDed
+        list. Each variant uses the same history_start and sampling_step.
+        The sample and episode thresholds apply separately to each variant.
         """
-
-        # Normalize the input into named criterion groups.
-        if variants is None:
+        if criteria is None:
             groups = {
                 "matched": (
                     AsOfCriterion("volatility", 20, 0.25),
                     AsOfCriterion("drawdown", 126, 0.50),
                 )
             }
-        elif isinstance(variants, dict):
-            groups = variants
-        elif isinstance(variants, (list, tuple)):
-            groups = {"matched": variants}
+        elif isinstance(criteria, dict):
+            groups = criteria
         else:
-            raise TypeError("variants must be a list, dictionary, or None")
-
+            groups = {"matched": criteria}
         if not groups:
-            raise ValueError("At least one variant is required")
-
+            raise ValueError("At least one criterion variant is required")
         normalized = {}
-        for name, criteria in groups.items():
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError("Variant names must be nonempty strings")
-            if not isinstance(criteria, (list, tuple)) or not criteria:
-                raise ValueError(
-                    f"{name}: criteria must be a nonempty list"
-                )
-            if not all(
-                isinstance(c, (AsOfCriterion, FixedValueCriterion))
-                for c in criteria
-            ):
-                raise TypeError(
-                    f"{name}: criteria must contain AsOfCriterion "
-                    "or FixedValueCriterion"
-                )
-            normalized[name] = tuple(criteria)
-
-        if (
-            sampling_step < 1
-            or min_samples < 1
-            or min_history_days < 2
-            or min_distinct_episodes < 1
-            or episode_gap_days < 0
-        ):
+        for variant_name, spec in groups.items():
+            if not isinstance(variant_name, str) or not variant_name.strip():
+                raise ValueError("Criterion variant names must be nonempty strings")
+            if isinstance(spec, (AsOfCriterion, FixedValueCriterion)):
+                group = (spec,)
+            elif isinstance(spec, (list, tuple)):
+                group = tuple(spec)
+            else:
+                raise TypeError(f"{variant_name}: expected Criterion or nonempty list")
+            if not group:
+                raise ValueError(f"{variant_name}: criteria cannot be empty")
+            if not all(isinstance(c, (AsOfCriterion, FixedValueCriterion)) for c in group):
+                raise TypeError(f"{variant_name}: criteria must contain Criterion objects")
+            normalized[variant_name] = group
+        if (not isinstance(sampling_step, (int, np.integer))
+                or isinstance(sampling_step, (bool, np.bool_))
+                or sampling_step < 1 or min_samples < 1
+                or min_history_days < 2 or min_distinct_episodes < 1
+                or episode_gap_days < 0):
             raise ValueError(
                 "sampling_step and minima must be positive; "
                 "min_history_days >=2, episode_gap_days >=0"
             )
-
-        # Historical candidates are shared by all variants.
         n = len(self.close)
         latest_start = n - self.horizon_days - 1
-        first = int(
-            self.close.index.searchsorted(pd.Timestamp(history_start))
-        )
-        candidates = np.arange(
-            first, latest_start + 1, sampling_step, dtype=int
-        )
-
-        available_days = int(
-            (self.close.index >= pd.Timestamp(history_start)).sum()
-        )
-
+        start_date = self._history_date(history_start)
+        first = int(self.close.index.searchsorted(start_date))
+        candidates = np.arange(first, latest_start + 1, sampling_step, dtype=int)
+        available_days = int((self.close.index >= start_date).sum())
+        candidate_index = self.close.index[candidates]
         common_details = {
-            "history_start": history_start,
+            "history_start": str(start_date.date()),
             "min_samples": min_samples,
             "min_history_days": min_history_days,
             "min_distinct_episodes": min_distinct_episodes,
             "episode_gap_days": episode_gap_days,
-            "sampling_step": sampling_step,
+            "sampling_step": int(sampling_step),
             "candidate_count": len(candidates),
             "available_history_days": available_days,
+            "first_candidate_start": (
+                str(candidate_index[0].date()) if len(candidate_index) else None
+            ),
+            "last_candidate_start": (
+                str(candidate_index[-1].date()) if len(candidate_index) else None
+            ),
         }
-
         results = {}
         close = self.close.to_numpy(dtype=float)
         steps = np.arange(1, self.horizon_days + 1)
-
-        for variant_name, criteria in normalized.items():
+        for variant_name, group in normalized.items():
             details = common_details.copy()
-
             if available_days < min_history_days:
                 results[variant_name] = self._empty(
                     variant_name,
-                    f"Need {min_history_days} history days, "
-                    f"got {available_days}",
+                    f"Need {min_history_days} history days, got {available_days}",
                     **details,
                 )
                 continue
-
             if not len(candidates):
                 results[variant_name] = self._empty(
-                    variant_name,
-                    "No completed historical forward windows",
-                    **details,
+                    variant_name, "No completed historical forward windows", **details,
                 )
                 continue
-
             mask = np.ones(len(candidates), dtype=bool)
             columns = {}
             criterion_details = []
             warning = None
-
-            for c in criteria:
+            for c in group:
                 series = self._indicator(c)
                 current = float(series.iloc[-1])
-
                 as_of_reference = isinstance(c, AsOfCriterion)
-                reference = (
-                    current if as_of_reference else float(c.value)
-                )
-
+                reference = current if as_of_reference else float(c.value)
                 if not np.isfinite(reference):
-                    warning = (
-                        f"As-of indicator {c.indicator}_{c.window} "
-                        "unavailable"
-                    )
+                    warning = f"As-of indicator {c.indicator}_{c.window} unavailable"
                     break
-
                 vals = series.iloc[candidates].to_numpy(dtype=float)
-
                 if c.match == "within":
                     if c.tolerance_mode == "relative":
                         if reference == 0:
                             raise ValueError(
-                                f"{c.indicator}_{c.window}: relative "
-                                "tolerance cannot be used with a zero "
-                                "reference value; use "
-                                "tolerance_mode='absolute'."
+                                f"{c.indicator}_{c.window}: relative tolerance "
+                                "cannot be used with zero reference; "
+                                "use tolerance_mode='absolute'."
                             )
                         margin = float(c.tolerance) * abs(reference)
                     else:
                         margin = float(c.tolerance)
-
-                    lower = reference - margin
-                    upper = reference + margin
+                    lower, upper = reference - margin, reference + margin
                     matches = (vals >= lower) & (vals <= upper)
-
                 elif c.match == "below":
                     lower, upper = None, reference
                     matches = vals <= reference
-
                 else:
                     lower, upper = reference, None
                     matches = vals >= reference
-
                 mask &= np.isfinite(vals) & matches
-
                 name = f"{c.indicator}_{c.window}"
-                key = name
-                suffix = 2
-
+                key, suffix = name, 2
                 while key in columns:
                     key = f"{name}_{suffix}"
                     suffix += 1
-
                 columns[key] = vals
-
-                source = (
-                    "as_of_date" if as_of_reference else "fixed_value"
-                )
-                tolerance_mode = (
-                    c.tolerance_mode if c.match == "within" else None
-                )
-
-                details[f"current_{key}"] = current
-                details[f"reference_{key}"] = reference
-                details[f"reference_source_{key}"] = source
-                details[f"match_{key}"] = c.match
-                details[f"tolerance_{key}"] = c.tolerance
-                details[f"tolerance_mode_{key}"] = tolerance_mode
-                details[f"lower_bound_{key}"] = lower
-                details[f"upper_bound_{key}"] = upper
-
+                source = "as_of_date" if as_of_reference else "fixed_value"
+                tolerance_mode = c.tolerance_mode if c.match == "within" else None
+                details.update({
+                    f"current_{key}": current,
+                    f"reference_{key}": reference,
+                    f"reference_source_{key}": source,
+                    f"match_{key}": c.match,
+                    f"tolerance_{key}": c.tolerance,
+                    f"tolerance_mode_{key}": tolerance_mode,
+                    f"lower_bound_{key}": lower,
+                    f"upper_bound_{key}": upper,
+                })
                 criterion_details.append({
                     "indicator": name,
                     "reference_source": source,
@@ -1642,70 +1640,47 @@ class PriceTargetAnalysis:
                     "lower_bound": lower,
                     "upper_bound": upper,
                 })
-
             details["criteria"] = criterion_details
-
             if warning is not None:
-                results[variant_name] = self._empty(
-                    variant_name, warning, **details
-                )
+                results[variant_name] = self._empty(variant_name, warning, **details)
                 continue
-
             selected = candidates[mask]
-
-            # Count clusters of matching trading-day start indices.
+            matched_index = self.close.index[selected]
             episodes = (
-                1 + int(
-                    np.sum(
-                        np.diff(selected) > episode_gap_days
-                    )
-                )
+                1 + int(np.sum(np.diff(selected) > episode_gap_days))
                 if len(selected) else 0
             )
-
             details.update({
                 "matched_dates": len(selected),
                 "distinct_episodes": episodes,
+                "first_matched_start": (
+                    str(matched_index[0].date()) if len(selected) else None
+                ),
+                "last_matched_start": (
+                    str(matched_index[-1].date()) if len(selected) else None
+                ),
             })
-
-            if (
-                len(selected) < min_samples
-                or episodes < min_distinct_episodes
-            ):
+            if len(selected) < min_samples or episodes < min_distinct_episodes:
                 reason = (
                     f"Insufficient matches: {len(selected)} dates "
-                    f"(minimum {min_samples}), "
-                    f"{episodes} episodes "
+                    f"(minimum {min_samples}), {episodes} episodes "
                     f"(minimum {min_distinct_episodes})"
                 )
-                results[variant_name] = self._empty(
-                    variant_name, reason, **details
-                )
+                results[variant_name] = self._empty(variant_name, reason, **details)
                 continue
-
             paths = (
-                self.reference_price
-                * close[selected[:, None] + steps]
+                self.reference_price * close[selected[:, None] + steps]
                 / close[selected, None]
             )
-
             features = pd.DataFrame({
-                key: vals[mask]
-                for key, vals in columns.items()
+                key: vals[mask] for key, vals in columns.items()
             })
-
             results[variant_name] = PathSample(
-                variant_name,
-                self.reference_price,
-                self.horizon_days,
-                paths,
-                details=details,
-                start_dates=self.close.index[selected],
-                features=features,
+                variant_name, self.reference_price, self.horizon_days,
+                paths, details=details,
+                start_dates=matched_index, features=features,
             )
-
         return self._results("Conditional empirical", results)
-
 
     def backtest(
         self, *, method: str = "empirical", threshold: float = -10.0,
@@ -1838,7 +1813,6 @@ class ModelComparison:
         horizon_days: int,
         as_of_date: Optional[str] = None,
         history_start: Optional[str] = None,
-        sampling_step: Optional[int] = None,
         min_history_days: Optional[int] = None,
         simulations: Optional[int] = None,
         random_seed: Optional[int] = None,
@@ -1863,7 +1837,6 @@ class ModelComparison:
         # Shared arguments apply only to methods that accept them.
         shared_values = {
             "history_start": history_start,
-            "sampling_step": sampling_step,
             "min_history_days": min_history_days,
             "simulations": simulations,
             "random_seed": random_seed,
@@ -1871,13 +1844,13 @@ class ModelComparison:
         accepted_shared = {
             "normal": ("simulations", "random_seed"),
             "empirical": (
-                "history_start", "sampling_step", "min_history_days",
+                "history_start", "min_history_days",
             ),
             "bootstrap": (
                 "history_start", "simulations", "random_seed",
             ),
             "conditional_empirical": (
-                "history_start", "sampling_step", "min_history_days",
+                "history_start", "min_history_days",
             ),
         }
 
@@ -1911,7 +1884,7 @@ class ModelComparison:
         thresholds: Sequence[float],
         pct: bool = True,
         mode: str = "mixed",
-        price_type: str = "terminal",
+        price_type: str | Sequence[str] = "terminal",
         horizon_days: Optional[int] = None,
         plot: bool = False,
         styled = True
@@ -1940,7 +1913,8 @@ class ModelComparison:
 
         frame = pd.concat(
             tables,
-            names=["method", "variant"],
+            names=["method", "variant"] if isinstance(price_type, str)
+            else ["method", "variant", "price_type"],
         )
 
         if plot:
@@ -1957,7 +1931,7 @@ class ModelComparison:
 
     def return_quantiles(
         self, *, probabilities: Sequence[float], pct: bool = True,
-        price_type: str = "terminal", horizon_days: Optional[int] = None,
+        price_type: str | Sequence[str] = "terminal", horizon_days: Optional[int] = None,
         styled: bool = True,
     ) -> pd.DataFrame | Styler:
         """Compare the same return/price quantiles across stored methods."""
@@ -1968,7 +1942,10 @@ class ModelComparison:
             )
             for method, result in self.results.items()
         }
-        frame = pd.concat(tables, names=["method", "variant"])
+        frame = pd.concat(
+            tables, names=["method", "variant"] if isinstance(price_type, str)
+            else ["method", "variant", "price_type"]
+        )
         return _quantiles_style(frame, pct=pct) if styled else frame
 
     def recovery_after_decline(
