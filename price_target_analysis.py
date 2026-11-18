@@ -442,6 +442,219 @@ class ModelResults:
             records.append(record)
         return pd.DataFrame(records).set_index("variant")
 
+
+    def plot_paths(
+        self, *, pct=True, show_statistics=True, show_paths=False,
+        max_paths=100, random_seed=42, fig=None,
+    ):
+        """Plot future price paths with Plotly.
+
+        Statistics (median, P10-P90, daily min/max) use all stored paths.
+        Individual paths are sampled without replacement, with a maximum
+        of max_paths per variant.
+
+        A supplied fig receives additional traces; otherwise a new Figure
+        is created. The Figure is returned without calling show().
+        """
+        import plotly.graph_objects as go
+        from plotly.colors import qualitative, hex_to_rgb
+
+        for key, value in (
+            ("pct", pct),
+            ("show_statistics", show_statistics),
+            ("show_paths", show_paths),
+        ):
+            if not isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"{key} must be boolean")
+
+        if not (show_statistics or show_paths):
+            raise ValueError(
+                "Enable show_statistics, show_paths, or both"
+            )
+        if (
+            isinstance(max_paths, (bool, np.bool_))
+            or not isinstance(max_paths, (int, np.integer))
+            or max_paths < 1
+        ):
+            raise ValueError("max_paths must be a positive integer")
+        if (
+            isinstance(random_seed, (bool, np.bool_))
+            or not isinstance(random_seed, (int, np.integer))
+            or random_seed < 0
+        ):
+            raise ValueError("random_seed must be a nonnegative integer")
+        if fig is not None and not isinstance(fig, go.Figure):
+            raise TypeError("fig must be a Plotly Figure or None")
+
+        valid = {
+            name: item for name, item in self.variants.items()
+            if item.status == "ok" and item.n_paths > 0
+        }
+        skipped = {
+            name: item for name, item in self.variants.items()
+            if name not in valid
+        }
+        if skipped:
+            _show_insufficient_data(self.method, skipped)
+        if not valid:
+            return fig
+
+        if fig is None:
+            fig = go.Figure()
+            fig.add_hline(
+                y=0 if pct else self.reference_price,
+                line_color="gray", line_dash="dot", opacity=0.7,
+            )
+            fig.update_layout(
+                title=f"{self.method}: price paths",
+                xaxis_title="Trading days from path start",
+                yaxis_title=(
+                    "Return from start (%)" if pct
+                    else "Normalized price / index level"
+                ),
+                legend=dict(groupclick="togglegroup"),
+                hovermode="closest",
+            )
+
+        ref = float(self.reference_price)
+        x = np.arange(self.horizon_days + 1)
+        rng = np.random.default_rng(random_seed)
+        used_groups = {
+            trace.legendgroup for trace in fig.data
+            if trace.legendgroup
+        }
+
+        for variant, item in valid.items():
+            if item.paths.shape != (item.n_paths, self.horizon_days):
+                raise ValueError(f"{variant}: invalid paths shape")
+            if not np.isfinite(item.paths).all() or (
+                item.paths <= 0
+            ).any():
+                raise ValueError(f"{variant}: invalid path prices")
+
+            group = f"{self.method} / {variant}"
+            color = qualitative.Plotly[
+                len(used_groups) % len(qualitative.Plotly)
+            ]
+            used_groups.add(group)
+            r, g, b = hex_to_rgb(color)
+
+            selected = np.array([], dtype=int)
+            if show_paths:
+                selected = (
+                    np.arange(item.n_paths)
+                    if item.n_paths <= max_paths
+                    else np.sort(
+                        rng.choice(
+                            item.n_paths,
+                            size=max_paths,
+                            replace=False,
+                        )
+                    )
+                )
+
+            caption = f"{group} (n={item.n_paths:,}"
+            if show_paths:
+                caption += f", shown={len(selected):,}"
+            caption += ")"
+
+            # Individual paths
+            for j, idx in enumerate(selected):
+                prices = np.r_[ref, item.paths[idx]]
+                returns = 100 * (prices / ref - 1)
+
+                date_info = (
+                    f"Historical start: "
+                    f"{pd.Timestamp(item.start_dates[idx]):%Y-%m-%d}"
+                    if item.start_dates is not None
+                    else f"Simulation path: {idx + 1}"
+                )
+
+                value_hover = (
+                    "Return: %{y:.2f}%"
+                    "<br>Normalized price: %{customdata:.2f}"
+                    if pct else
+                    "Normalized price: %{y:.2f}"
+                    "<br>Return: %{customdata:.2f}%"
+                )
+
+                fig.add_trace(go.Scattergl(
+                    x=x,
+                    y=returns if pct else prices,
+                    customdata=prices if pct else returns,
+                    mode="lines",
+                    name=caption,
+                    legendgroup=group,
+                    showlegend=(not show_statistics and j == 0),
+                    line=dict(
+                        color=f"rgba({r},{g},{b},0.25)",
+                        width=1,
+                    ),
+                    hovertemplate=(
+                        f"{group}<br>{date_info}"
+                        "<br>Day: %{x}<br>"
+                        + value_hover + "<extra></extra>"
+                    ),
+                ))
+
+            # Day-by-day statistics over ALL stored paths
+            if show_statistics:
+                p10, med, p90 = np.percentile(
+                    item.paths, [10, 50, 90], axis=0
+                )
+                minimum = item.paths.min(axis=0)
+                maximum = item.paths.max(axis=0)
+
+                for label, series, dash, width in (
+                    ("P10", p10, "solid", 0.8),
+                    ("P90", p90, "solid", 0.8),
+                    ("Min", minimum, "dot", 1.0),
+                    ("Max", maximum, "dot", 1.0),
+                    ("Median", med, "solid", 2.5),
+                ):
+                    prices = np.r_[ref, series]
+                    y = (
+                        100 * (prices / ref - 1)
+                        if pct else prices
+                    )
+
+                    fig.add_trace(go.Scatter(
+                        x=x,
+                        y=y,
+                        mode="lines",
+                        name=(
+                            caption if label == "Median"
+                            else f"{group} {label}"
+                        ),
+                        legendgroup=group,
+                        showlegend=(label == "Median"),
+                        line=dict(
+                            color=color,
+                            dash=dash,
+                            width=width,
+                        ),
+                        fill=(
+                            "tonexty" if label == "P90"
+                            else None
+                        ),
+                        fillcolor=(
+                            f"rgba({r},{g},{b},0.14)"
+                            if label == "P90" else None
+                        ),
+                        hovertemplate=(
+                            f"{group} — {label}"
+                            "<br>Day: %{x}<br>"
+                            + (
+                                "Return: %{y:.2f}%" if pct
+                                else "Normalized price: %{y:.2f}"
+                            )
+                            + "<extra></extra>"
+                        ),
+                    ))
+
+        return fig
+
+
     def threshold_probabilities(
         self, *, thresholds: float | Sequence[float], pct: bool = True,
         mode: str = "mixed", price_type: str | Sequence[str] = "terminal",
