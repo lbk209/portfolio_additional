@@ -424,6 +424,7 @@ class ModelResults:
     as_of_date: pd.Timestamp
     reference_price: float
     horizon_days: int
+    historical_close: Optional[pd.Series] = None
 
     def summary(self, short=False) -> pd.DataFrame:
         record_short = {
@@ -442,47 +443,62 @@ class ModelResults:
             records.append(record)
         return pd.DataFrame(records).set_index("variant")
 
-
     def plot_paths(
         self, *, pct=True, show_statistics=True, show_paths=False,
-        max_paths=100, random_seed=42, fig=None,
+        max_paths=100, random_seed=42, history_days=None,
+        width=None, height=None, show_method=False, fig=None,
     ):
-        """Plot future price paths with Plotly.
+        """Plot stored price paths, optionally including historical context.
 
-        Statistics (median, P10-P90, daily min/max) use all stored paths.
-        Individual paths are sampled without replacement, with a maximum
-        of max_paths per variant.
+        Statistics (median, pointwise P10-P90, daily min/max) are calculated
+        from ALL future paths and shown only for trading days t=0,...,H.
+        Individual paths are sampled without replacement, up to max_paths
+        per variant. For dated historical paths, history_days preceding t=0
+        are shown when show_paths=True. None uses horizon_days; 0 disables
+        history. Past closes and future paths are rebased to the historical
+        starting close, then expressed relative to as_of_date's reference.
+        Simulated paths without start_dates have no historical prefix.
 
-        A supplied fig receives additional traces; otherwise a new Figure
-        is created. The Figure is returned without calling show().
+        Legend entries are variant names by default; show_method=True prefixes
+        the method for multi-method comparisons. An optional Figure receives
+        additional traces; the Figure is returned without calling show().
+        width and height are pixels; when adding to an existing Figure, an
+        omitted dimension leaves the existing layout unchanged.
         """
         import plotly.graph_objects as go
-        from plotly.colors import qualitative, hex_to_rgb
+        from plotly.colors import hex_to_rgb, qualitative
 
-        for key, value in (
+        for name, flag in (
             ("pct", pct),
             ("show_statistics", show_statistics),
             ("show_paths", show_paths),
+            ("show_method", show_method),
         ):
-            if not isinstance(value, (bool, np.bool_)):
-                raise ValueError(f"{key} must be boolean")
-
+            if not isinstance(flag, (bool, np.bool_)):
+                raise ValueError(f"{name} must be boolean")
         if not (show_statistics or show_paths):
-            raise ValueError(
-                "Enable show_statistics, show_paths, or both"
-            )
-        if (
-            isinstance(max_paths, (bool, np.bool_))
-            or not isinstance(max_paths, (int, np.integer))
-            or max_paths < 1
+            raise ValueError("Enable show_statistics, show_paths, or both")
+
+        for name, value, minimum in (
+            ("max_paths", max_paths, 1),
+            ("random_seed", random_seed, 0),
         ):
-            raise ValueError("max_paths must be a positive integer")
-        if (
-            isinstance(random_seed, (bool, np.bool_))
-            or not isinstance(random_seed, (int, np.integer))
-            or random_seed < 0
-        ):
-            raise ValueError("random_seed must be a nonnegative integer")
+            if (isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, np.integer))
+                    or value < minimum):
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+        history_days = self.horizon_days if history_days is None else history_days
+        if (isinstance(history_days, (bool, np.bool_))
+                or not isinstance(history_days, (int, np.integer))
+                or history_days < 0):
+            raise ValueError("history_days must be None or a nonnegative integer")
+        for name, dimension in (("width", width), ("height", height)):
+            if dimension is not None and (
+                isinstance(dimension, (bool, np.bool_))
+                or not isinstance(dimension, (int, np.integer))
+                or dimension <= 0
+            ):
+                raise ValueError(f"{name} must be None or a positive integer")
         if fig is not None and not isinstance(fig, go.Figure):
             raise TypeError("fig must be a Plotly Figure or None")
 
@@ -503,73 +519,96 @@ class ModelResults:
             fig = go.Figure()
             fig.add_hline(
                 y=0 if pct else self.reference_price,
-                line_color="gray", line_dash="dot", opacity=0.7,
+                line_color="gray", line_dash="dot", opacity=0.65,
             )
+            fig.add_vline(x=0, line_color="gray", line_dash="dot", opacity=0.5)
             fig.update_layout(
                 title=f"{self.method}: price paths",
-                xaxis_title="Trading days from path start",
+                xaxis_title="Trading days from historical start (t=0)",
                 yaxis_title=(
-                    "Return from start (%)" if pct
-                    else "Normalized price / index level"
+                    "Return from path start (%)" if pct
+                    else "Price / index level (rebased to as_of_date)"
                 ),
                 legend=dict(groupclick="togglegroup"),
                 hovermode="closest",
+                width=1200 if width is None else int(width),
+                height=600 if height is None else int(height),
             )
+        elif width is not None or height is not None:
+            fig.update_layout(**{
+                name: int(value)
+                for name, value in (("width", width), ("height", height))
+                if value is not None
+            })
 
-        ref = float(self.reference_price)
-        x = np.arange(self.horizon_days + 1)
+        reference = float(self.reference_price)
+        future_x = np.arange(self.horizon_days + 1)
         rng = np.random.default_rng(random_seed)
         used_groups = {
-            trace.legendgroup for trace in fig.data
-            if trace.legendgroup
+            trace.legendgroup for trace in fig.data if trace.legendgroup
         }
 
         for variant, item in valid.items():
             if item.paths.shape != (item.n_paths, self.horizon_days):
                 raise ValueError(f"{variant}: invalid paths shape")
-            if not np.isfinite(item.paths).all() or (
-                item.paths <= 0
-            ).any():
+            if not np.isfinite(item.paths).all() or (item.paths <= 0).any():
                 raise ValueError(f"{variant}: invalid path prices")
 
+            is_historical = item.start_dates is not None
+            if is_historical and len(item.start_dates) != item.n_paths:
+                raise ValueError(f"{variant}: start_dates count does not match paths")
+            if show_paths and is_historical and history_days:
+                if self.historical_close is None:
+                    raise ValueError(
+                        f"{variant}: historical_close is required for history_days > 0"
+                    )
+                if not isinstance(self.historical_close, pd.Series):
+                    raise TypeError("historical_close must be a pandas Series")
+
             group = f"{self.method} / {variant}"
-            color = qualitative.Plotly[
-                len(used_groups) % len(qualitative.Plotly)
-            ]
+            color = qualitative.Plotly[len(used_groups) % len(qualitative.Plotly)]
             used_groups.add(group)
             r, g, b = hex_to_rgb(color)
+            shown_name = group if show_method else variant
 
             selected = np.array([], dtype=int)
             if show_paths:
                 selected = (
                     np.arange(item.n_paths)
-                    if item.n_paths <= max_paths
-                    else np.sort(
-                        rng.choice(
-                            item.n_paths,
-                            size=max_paths,
-                            replace=False,
-                        )
-                    )
+                    if item.n_paths <= max_paths else
+                    np.sort(rng.choice(item.n_paths, size=max_paths, replace=False))
                 )
 
-            caption = f"{group} (n={item.n_paths:,}"
+            caption = f"{shown_name} (n={item.n_paths:,}"
             if show_paths:
                 caption += f", shown={len(selected):,}"
             caption += ")"
 
-            # Individual paths
             for j, idx in enumerate(selected):
-                prices = np.r_[ref, item.paths[idx]]
-                returns = 100 * (prices / ref - 1)
+                prices = np.r_[reference, item.paths[idx]]
+                x = future_x
+                if is_historical:
+                    date = pd.Timestamp(item.start_dates[idx])
+                    date_info = f"Historical start: {date:%Y-%m-%d}"
+                    if history_days > 0:
+                        close = self.historical_close
+                        pos = close.index.get_indexer([date])[0]
+                        if pos < 0:
+                            raise ValueError(
+                                f"{variant}: historical start {date:%Y-%m-%d} "
+                                "not found in historical_close"
+                            )
+                        begin = max(0, pos - int(history_days))
+                        past = close.iloc[begin:pos].to_numpy(dtype=float)
+                        start_close = float(close.iloc[pos])
+                        if not np.isfinite(start_close) or start_close <= 0:
+                            raise ValueError(f"{variant}: invalid historical start close")
+                        prices = np.r_[reference * past / start_close, prices]
+                        x = np.arange(-(pos - begin), self.horizon_days + 1)
+                else:
+                    date_info = f"Simulation path: {idx + 1}"
 
-                date_info = (
-                    f"Historical start: "
-                    f"{pd.Timestamp(item.start_dates[idx]):%Y-%m-%d}"
-                    if item.start_dates is not None
-                    else f"Simulation path: {idx + 1}"
-                )
-
+                returns = 100.0 * (prices / reference - 1.0)
                 value_hover = (
                     "Return: %{y:.2f}%"
                     "<br>Normalized price: %{customdata:.2f}"
@@ -577,77 +616,55 @@ class ModelResults:
                     "Normalized price: %{y:.2f}"
                     "<br>Return: %{customdata:.2f}%"
                 )
-
                 fig.add_trace(go.Scattergl(
-                    x=x,
-                    y=returns if pct else prices,
+                    x=x, y=returns if pct else prices,
                     customdata=prices if pct else returns,
-                    mode="lines",
-                    name=caption,
+                    mode="lines", name=caption,
                     legendgroup=group,
                     showlegend=(not show_statistics and j == 0),
-                    line=dict(
-                        color=f"rgba({r},{g},{b},0.25)",
-                        width=1,
-                    ),
+                    line=dict(color=f"rgba({r},{g},{b},0.25)", width=1),
                     hovertemplate=(
-                        f"{group}<br>{date_info}"
-                        "<br>Day: %{x}<br>"
+                        f"{shown_name}<br>{date_info}"
+                        "<br>Trading day: %{x}<br>"
                         + value_hover + "<extra></extra>"
                     ),
                 ))
 
-            # Day-by-day statistics over ALL stored paths
+            # All statistics start at t=0, regardless of historical prefixes.
             if show_statistics:
-                p10, med, p90 = np.percentile(
+                p10, median, p90 = np.percentile(
                     item.paths, [10, 50, 90], axis=0
                 )
                 minimum = item.paths.min(axis=0)
                 maximum = item.paths.max(axis=0)
 
-                for label, series, dash, width in (
+                for label, values, dash, line_width in (
                     ("P10", p10, "solid", 0.8),
                     ("P90", p90, "solid", 0.8),
                     ("Min", minimum, "dot", 1.0),
                     ("Max", maximum, "dot", 1.0),
-                    ("Median", med, "solid", 2.5),
+                    ("Median", median, "solid", 2.5),
                 ):
-                    prices = np.r_[ref, series]
+                    prices = np.r_[reference, values]
                     y = (
-                        100 * (prices / ref - 1)
+                        100.0 * (prices / reference - 1.0)
                         if pct else prices
                     )
-
                     fig.add_trace(go.Scatter(
-                        x=x,
-                        y=y,
-                        mode="lines",
-                        name=(
-                            caption if label == "Median"
-                            else f"{group} {label}"
-                        ),
+                        x=future_x, y=y, mode="lines",
+                        name=caption if label == "Median" else f"{shown_name} {label}",
                         legendgroup=group,
                         showlegend=(label == "Median"),
-                        line=dict(
-                            color=color,
-                            dash=dash,
-                            width=width,
-                        ),
-                        fill=(
-                            "tonexty" if label == "P90"
-                            else None
-                        ),
+                        line=dict(color=color, dash=dash, width=line_width),
+                        fill="tonexty" if label == "P90" else None,
                         fillcolor=(
-                            f"rgba({r},{g},{b},0.14)"
-                            if label == "P90" else None
+                            f"rgba({r},{g},{b},0.14)" if label == "P90" else None
                         ),
                         hovertemplate=(
-                            f"{group} — {label}"
-                            "<br>Day: %{x}<br>"
-                            + (
-                                "Return: %{y:.2f}%" if pct
-                                else "Normalized price: %{y:.2f}"
-                            )
+                            f"{shown_name} — {label}"
+                            "<br>Trading day: %{x}<br>"
+                            + ("Return: %{y:.2f}%" if pct
+                               else "Normalized price: %{y:.2f}")
                             + "<extra></extra>"
                         ),
                     ))
@@ -880,7 +897,10 @@ class ModelResults:
         Conservative order statistics keep the *observed* joint path coverage
         at least probability. The two bounds are not claimed to form the
         narrowest possible interval. This is model/sample coverage, not a
-        guarantee about an actual future market path.
+        guarantee about an actual future market path. Unlike pointwise
+        quantile bands in plot_paths(), the bounds constrain whole paths
+        through each specified horizon; coverage is tested separately at
+        each horizon.
 
         Compare bounds across volatility lookbacks at fixed horizon/coverage;
         unlike terminal threshold_probabilities(), these are simultaneous
@@ -942,7 +962,12 @@ class ModelResults:
         self, *, probability: float = 0.90,
         variant: Optional[str] = None,
     ) -> None:
-        """Plot pathwise price envelopes over the full horizon.
+        """Plot whole-path price envelopes over the full horizon.
+
+        At each horizon, the bounds contain at least the requested fraction
+        of complete sampled paths, unlike pointwise quantiles in plot_paths().
+        They do not represent individual trajectories; coverage is evaluated
+        separately at each horizon.
 
         variant=None plots all valid variants.
         Variant names appear only in the legend.
@@ -1493,7 +1518,7 @@ class PriceTargetAnalysis:
 
     def _results(self, method: str, variants: dict[str, PathSample]) -> ModelResults:
         return ModelResults(method, variants, self.as_of_date, self.reference_price,
-                            self.horizon_days)
+                            self.horizon_days, historical_close=self.close)
 
     def normal(
         self, *, lookback_days: int | Sequence[int] | dict[str, int] = (20, 60, 120),
