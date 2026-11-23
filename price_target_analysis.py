@@ -285,16 +285,21 @@ def _validate_criterion_fields(indicator, window, match, tolerance, tolerance_mo
 
 @dataclass(frozen=True)
 class AsOfCriterion:
-    """Match historical indicator values to their value at as_of_date.
-    
-    indicator resolves to PriceTargetAnalysis.indicator_<name>(window).
-    The same window is used to calculate the indicator at as_of_date
-    and at each historical starting date.
-    
-    For match='within', relative tolerance (default) permits a distance of
-    tolerance * abs(as_of_value); absolute tolerance uses indicator units.
-    An exactly zero relative reference raises ValueError during matching.
-    match='below' and 'above' compare to the reference without a tolerance.
+    """Match historical trailing indicators against their as-of values.
+
+    Args:
+        indicator: Indicator name; resolved as indicator_<name>(window) on
+            PriceTargetAnalysis. Built-ins: volatility, drawdown, range_position.
+        window: Rolling indicator lookback, in price observations (>= 2).
+        tolerance: Nonnegative distance from the as-of indicator for
+            match='within'; required only for that match mode.
+        match: 'within' (inclusive two-sided range), 'above' (>= reference),
+            or 'below' (<= reference). For above/below, omit tolerance.
+        tolerance_mode: 'relative' (default: tolerance * abs(reference)) or
+            'absolute' (tolerance in indicator units). Relevant to 'within'.
+
+    Both historical and as-of indicator values use the same window. A zero
+    reference cannot be used with relative tolerance for match='within'.
     """
     indicator: str
     window: int
@@ -311,15 +316,23 @@ class AsOfCriterion:
 
 @dataclass(frozen=True)
 class FixedValueCriterion:
-    """Match historical indicator values to a user-specified reference value.
-    
-    indicator resolves to PriceTargetAnalysis.indicator_<name>(window).
-    window is used to calculate the indicator at each historical starting
-    date, while the user-specified value requires no indicator calculation
-    at as_of_date.
-    
-    The value is independent of as_of_date; the same within/above/below and
-    relative/absolute conventions as AsOfCriterion apply.
+    """Match historical trailing indicators against an explicit fixed value.
+
+    Args:
+        indicator: Indicator name; resolved as indicator_<name>(window) on
+            PriceTargetAnalysis. Built-ins: volatility, drawdown, range_position.
+        window: Rolling indicator lookback, in price observations (>= 2).
+        value: Fixed reference in indicator units, independent of as_of_date.
+        tolerance: Nonnegative distance from value when match='within';
+            required only for that match mode.
+        match: 'within' (inclusive two-sided range), 'above' (>= value),
+            or 'below' (<= value). For above/below, omit tolerance.
+        tolerance_mode: 'relative' (default: tolerance * abs(value)) or
+            'absolute' (tolerance in indicator units). Relevant to 'within'.
+
+    A zero value cannot be used with relative tolerance for match='within'.
+    Unlike AsOfCriterion, the comparison does not require a valid latest
+    indicator value; only historical candidate values need to be finite.
     """
     indicator: str
     window: int
@@ -348,7 +361,7 @@ class PathSample:
 
     paths has shape (N, H) and excludes the starting close. Each historical
     path is rescaled to reference_price; it does NOT claim historical levels
-    equal today's level. Empty paths indicate insufficient historical evidence.
+    equal today's level. An empty path array indicates no usable paths.
     """
     name: str
     reference_price: float
@@ -443,12 +456,11 @@ class ModelResults:
             records.append(record)
         return pd.DataFrame(records).set_index("variant")
 
-
     def plot_paths(
         self, *, pct=True, show_statistics=True, show_paths=False,
         max_paths=100, random_seed=42, history_days=None,
-        path_alpha=0.55, show_as_of_history=True,
         width=None, height=None, show_method=False, fig=None,
+        path_alpha=0.55, show_as_of_history=True,
     ):
         """Plot stored price paths with optional historical context.
 
@@ -480,11 +492,8 @@ class ModelResults:
         ):
             if not isinstance(flag, (bool, np.bool_)):
                 raise ValueError(f"{name} must be boolean")
-
         if not (show_statistics or show_paths):
-            raise ValueError(
-                "Enable show_statistics, show_paths, or both"
-            )
+            raise ValueError("Enable show_statistics, show_paths, or both")
 
         for name, value, minimum in (
             ("max_paths", max_paths, 1),
@@ -493,46 +502,25 @@ class ModelResults:
             if (isinstance(value, (bool, np.bool_))
                     or not isinstance(value, (int, np.integer))
                     or value < minimum):
-                raise ValueError(
-                    f"{name} must be an integer >= {minimum}"
-                )
-
+                raise ValueError(f"{name} must be an integer >= {minimum}")
         if (isinstance(path_alpha, (bool, np.bool_))
-                or not isinstance(
-                    path_alpha,
-                    (int, float, np.integer, np.floating)
-                )
-                or not np.isfinite(path_alpha)
-                or not 0 < path_alpha <= 1):
+                or not isinstance(path_alpha, (int, float, np.integer, np.floating))
+                or not np.isfinite(path_alpha) or not 0 < path_alpha <= 1):
             raise ValueError("path_alpha must be in (0, 1]")
-
-        history_days = (
-            self.horizon_days
-            if history_days is None else history_days
-        )
+        history_days = self.horizon_days if history_days is None else history_days
         if (isinstance(history_days, (bool, np.bool_))
                 or not isinstance(history_days, (int, np.integer))
                 or history_days < 0):
-            raise ValueError(
-                "history_days must be None or a nonnegative integer"
-            )
-
-        for name, dimension in (
-            ("width", width), ("height", height)
-        ):
+            raise ValueError("history_days must be None or a nonnegative integer")
+        for name, dimension in (("width", width), ("height", height)):
             if dimension is not None and (
                 isinstance(dimension, (bool, np.bool_))
                 or not isinstance(dimension, (int, np.integer))
                 or dimension <= 0
             ):
-                raise ValueError(
-                    f"{name} must be None or a positive integer"
-                )
-
+                raise ValueError(f"{name} must be None or a positive integer")
         if fig is not None and not isinstance(fig, go.Figure):
-            raise TypeError(
-                "fig must be a Plotly Figure or None"
-            )
+            raise TypeError("fig must be a Plotly Figure or None")
 
         valid = {
             name: item for name, item in self.variants.items()
@@ -542,7 +530,6 @@ class ModelResults:
             name: item for name, item in self.variants.items()
             if name not in valid
         }
-
         if skipped:
             _show_insufficient_data(self.method, skipped)
         if not valid:
@@ -552,16 +539,9 @@ class ModelResults:
             fig = go.Figure()
             fig.add_hline(
                 y=0 if pct else self.reference_price,
-                line_color="gray",
-                line_dash="dot",
-                opacity=0.65,
+                line_color="gray", line_dash="dot", opacity=0.65,
             )
-            fig.add_vline(
-                x=0,
-                line_color="gray",
-                line_dash="dot",
-                opacity=0.5,
-            )
+            fig.add_vline(x=0, line_color="gray", line_dash="dot", opacity=0.5)
             fig.update_layout(
                 title=f"{self.method}: price paths",
                 xaxis_title="Trading days from path start (t=0)",
@@ -577,64 +557,38 @@ class ModelResults:
         elif width is not None or height is not None:
             fig.update_layout(**{
                 name: int(value)
-                for name, value in (
-                    ("width", width),
-                    ("height", height),
-                )
+                for name, value in (("width", width), ("height", height))
                 if value is not None
             })
 
         reference = float(self.reference_price)
         future_x = np.arange(self.horizon_days + 1)
         rng = np.random.default_rng(random_seed)
-
         as_of_group = "__as_of_history__"
         used_groups = {
-            trace.legendgroup
-            for trace in fig.data
-            if trace.legendgroup
-            and trace.legendgroup != as_of_group
+            trace.legendgroup for trace in fig.data
+            if trace.legendgroup and trace.legendgroup != as_of_group
         }
 
         for variant, item in valid.items():
-            if item.paths.shape != (
-                item.n_paths, self.horizon_days
-            ):
-                raise ValueError(
-                    f"{variant}: invalid paths shape"
-                )
-            if not np.isfinite(item.paths).all() or (
-                item.paths <= 0
-            ).any():
-                raise ValueError(
-                    f"{variant}: invalid path prices"
-                )
+            if item.paths.shape != (item.n_paths, self.horizon_days):
+                raise ValueError(f"{variant}: invalid paths shape")
+            if not np.isfinite(item.paths).all() or (item.paths <= 0).any():
+                raise ValueError(f"{variant}: invalid path prices")
 
             is_historical = item.start_dates is not None
-            if is_historical and (
-                len(item.start_dates) != item.n_paths
-            ):
-                raise ValueError(
-                    f"{variant}: start_dates count does not match paths"
-                )
-
+            if is_historical and len(item.start_dates) != item.n_paths:
+                raise ValueError(f"{variant}: start_dates count does not match paths")
             if show_paths and is_historical and history_days:
                 if self.historical_close is None:
                     raise ValueError(
-                        f"{variant}: historical_close is required "
-                        "for history_days > 0"
+                        f"{variant}: historical_close is required for history_days > 0"
                     )
-                if not isinstance(
-                    self.historical_close, pd.Series
-                ):
-                    raise TypeError(
-                        "historical_close must be a pandas Series"
-                    )
+                if not isinstance(self.historical_close, pd.Series):
+                    raise TypeError("historical_close must be a pandas Series")
 
             group = f"{self.method} / {variant}"
-            color = qualitative.Plotly[
-                len(used_groups) % len(qualitative.Plotly)
-            ]
+            color = qualitative.Plotly[len(used_groups) % len(qualitative.Plotly)]
             used_groups.add(group)
             r, g, b = hex_to_rgb(color)
             shown_name = group if show_method else variant
@@ -643,14 +597,8 @@ class ModelResults:
             if show_paths:
                 selected = (
                     np.arange(item.n_paths)
-                    if item.n_paths <= max_paths
-                    else np.sort(
-                        rng.choice(
-                            item.n_paths,
-                            size=max_paths,
-                            replace=False,
-                        )
-                    )
+                    if item.n_paths <= max_paths else
+                    np.sort(rng.choice(item.n_paths, size=max_paths, replace=False))
                 )
 
             caption = f"{shown_name} (n={item.n_paths:,}"
@@ -658,55 +606,31 @@ class ModelResults:
                 caption += f", shown={len(selected):,}"
             caption += ")"
 
-            # Individual paths: same alpha for past and future.
             for j, idx in enumerate(selected):
                 prices = np.r_[reference, item.paths[idx]]
                 x = future_x
-
                 if is_historical:
                     date = pd.Timestamp(item.start_dates[idx])
-                    date_info = (
-                        f"Historical start: {date:%Y-%m-%d}"
-                    )
-
+                    date_info = f"Historical start: {date:%Y-%m-%d}"
                     if history_days > 0:
                         close = self.historical_close
                         pos = close.index.get_indexer([date])[0]
                         if pos < 0:
                             raise ValueError(
-                                f"{variant}: historical start "
-                                f"{date:%Y-%m-%d} not found"
+                                f"{variant}: historical start {date:%Y-%m-%d} "
+                                "not found in historical_close"
                             )
-
                         begin = max(0, pos - int(history_days))
-                        past = close.iloc[begin:pos].to_numpy(
-                            dtype=float
-                        )
+                        past = close.iloc[begin:pos].to_numpy(dtype=float)
                         start_close = float(close.iloc[pos])
-
-                        if (
-                            not np.isfinite(start_close)
-                            or start_close <= 0
-                        ):
-                            raise ValueError(
-                                f"{variant}: invalid historical "
-                                "start close"
-                            )
-
-                        prices = np.r_[
-                            reference * past / start_close,
-                            prices,
-                        ]
-                        x = np.arange(
-                            -(pos - begin),
-                            self.horizon_days + 1,
-                        )
+                        if not np.isfinite(start_close) or start_close <= 0:
+                            raise ValueError(f"{variant}: invalid historical start close")
+                        prices = np.r_[reference * past / start_close, prices]
+                        x = np.arange(-(pos - begin), self.horizon_days + 1)
                 else:
                     date_info = f"Simulation path: {idx + 1}"
 
-                returns = 100.0 * (
-                    prices / reference - 1.0
-                )
+                returns = 100.0 * (prices / reference - 1.0)
                 value_hover = (
                     "Return: %{y:.2f}%"
                     "<br>Normalized price: %{customdata:.2f}"
@@ -714,32 +638,21 @@ class ModelResults:
                     "Normalized price: %{y:.2f}"
                     "<br>Return: %{customdata:.2f}%"
                 )
-
                 fig.add_trace(go.Scattergl(
-                    x=x,
-                    y=returns if pct else prices,
+                    x=x, y=returns if pct else prices,
                     customdata=prices if pct else returns,
-                    mode="lines",
-                    name=caption,
+                    mode="lines", name=caption,
                     legendgroup=group,
-                    showlegend=(
-                        not show_statistics and j == 0
-                    ),
-                    line=dict(
-                        color=(
-                            f"rgba({r},{g},{b},{path_alpha})"
-                        ),
-                        width=1,
-                    ),
+                    showlegend=(not show_statistics and j == 0),
+                    line=dict(color=f"rgba({r},{g},{b},{path_alpha})", width=1),
                     hovertemplate=(
                         f"{shown_name}<br>{date_info}"
                         "<br>Trading day: %{x}<br>"
-                        + value_hover
-                        + "<extra></extra>"
+                        + value_hover + "<extra></extra>"
                     ),
                 ))
 
-            # Statistics always begin at t=0.
+            # All statistics start at t=0, regardless of historical prefixes.
             if show_statistics:
                 p10, median, p90 = np.percentile(
                     item.paths, [10, 50, 90], axis=0
@@ -756,107 +669,56 @@ class ModelResults:
                 ):
                     prices = np.r_[reference, values]
                     y = (
-                        100.0 * (
-                            prices / reference - 1.0
-                        )
+                        100.0 * (prices / reference - 1.0)
                         if pct else prices
                     )
-
                     fig.add_trace(go.Scatter(
-                        x=future_x,
-                        y=y,
-                        mode="lines",
-                        name=(
-                            caption if label == "Median"
-                            else f"{shown_name} {label}"
-                        ),
+                        x=future_x, y=y, mode="lines",
+                        name=caption if label == "Median" else f"{shown_name} {label}",
                         legendgroup=group,
                         showlegend=(label == "Median"),
-                        line=dict(
-                            color=color,
-                            dash=dash,
-                            width=line_width,
-                        ),
-                        fill=(
-                            "tonexty" if label == "P90"
-                            else None
-                        ),
+                        line=dict(color=color, dash=dash, width=line_width),
+                        fill="tonexty" if label == "P90" else None,
                         fillcolor=(
-                            f"rgba({r},{g},{b},0.14)"
-                            if label == "P90" else None
+                            f"rgba({r},{g},{b},0.14)" if label == "P90" else None
                         ),
                         hovertemplate=(
                             f"{shown_name} — {label}"
                             "<br>Trading day: %{x}<br>"
-                            + (
-                                "Return: %{y:.2f}%" if pct
-                                else "Normalized price: %{y:.2f}"
-                            )
+                            + ("Return: %{y:.2f}%" if pct
+                               else "Normalized price: %{y:.2f}")
                             + "<extra></extra>"
                         ),
                     ))
 
-        # Actual price history preceding as_of_date.
-        # This applies to ALL methods and is drawn only once
-        # when multiple ModelResults share the same Figure.
+        # Actual price history preceding as_of_date; only one trace per Figure.
         already_shown = any(
-            trace.legendgroup == as_of_group
-            for trace in fig.data
+            trace.legendgroup == as_of_group for trace in fig.data
         )
-
-        if (
-            show_as_of_history
-            and history_days > 0
-            and not already_shown
-            and self.historical_close is not None
-        ):
-            if not isinstance(
-                self.historical_close, pd.Series
-            ):
-                raise TypeError(
-                    "historical_close must be a pandas Series"
-                )
-
+        if (show_as_of_history and history_days > 0 and not already_shown
+                and self.historical_close is not None):
+            if not isinstance(self.historical_close, pd.Series):
+                raise TypeError("historical_close must be a pandas Series")
             actual = (
-                self.historical_close
-                .loc[:self.as_of_date]
+                self.historical_close.loc[:self.as_of_date]
                 .iloc[-(int(history_days) + 1):]
             )
-
             if not actual.empty:
                 actual_prices = actual.to_numpy(dtype=float)
-                actual_returns = 100.0 * (
-                    actual_prices / reference - 1.0
-                )
-                actual_x = np.arange(
-                    1 - len(actual), 1
-                )
-
+                actual_returns = 100.0 * (actual_prices / reference - 1.0)
+                actual_x = np.arange(1 - len(actual), 1)
                 fig.add_trace(go.Scatter(
                     x=actual_x,
-                    y=(
-                        actual_returns if pct
-                        else actual_prices
-                    ),
-                    customdata=actual.index.strftime(
-                        "%Y-%m-%d"
-                    ),
-                    mode="lines",
-                    name="As-of history",
-                    legendgroup=as_of_group,
-                    showlegend=True,
-                    line=dict(
-                        color="black",
-                        width=2.5,
-                    ),
+                    y=actual_returns if pct else actual_prices,
+                    customdata=actual.index.strftime("%Y-%m-%d"),
+                    mode="lines", name="As-of history",
+                    legendgroup=as_of_group, showlegend=True,
+                    line=dict(color="black", width=2.5),
                     hovertemplate=(
-                        "As-of history"
-                        "<br>Date: %{customdata}"
+                        "As-of history<br>Date: %{customdata}"
                         "<br>Trading day: %{x}<br>"
-                        + (
-                            "Return: %{y:.2f}%" if pct
-                            else "Price / index: %{y:.2f}"
-                        )
+                        + ("Return: %{y:.2f}%" if pct
+                           else "Price / index: %{y:.2f}")
                         + "<extra></extra>"
                     ),
                 ))
@@ -1543,9 +1405,6 @@ class ModelResults:
                     density = density * 100.0 / reference
     
                 label = f"{key} (n={item.n_paths}"
-                episodes = item.details.get("distinct_episodes")
-                if episodes is not None:
-                    label += f", episodes={episodes}"
                 label += ")"
     
                 ax.plot(
@@ -1913,23 +1772,50 @@ class PriceTargetAnalysis:
 
 
     def conditional_empirical(
-        self, *, history_start: Optional[str] = None,
+        self, *,
+        history_start: Optional[str] = None,
         criteria: Optional[
             Criterion | Sequence[Criterion] |
             dict[str, Criterion | Sequence[Criterion]]
         ] = None,
         sampling_step: int = 1,
-        min_samples: int = 30,
-        min_history_days: int = 252,
-        min_distinct_episodes: int = 2,
-        episode_gap_days: int = 5,
     ) -> ModelResults:
-        """Condition historical forward paths on trailing price-state criteria.
+        """Build historical forward paths matching trailing price-state criteria.
 
-        A single Criterion or list/tuple of ANDed criteria creates the one
-        'matched' variant. A dict maps variant names to a Criterion or ANDed
-        list. Each variant uses the same history_start and sampling_step.
-        The sample and episode thresholds apply separately to each variant.
+        Args:
+            history_start:
+                Earliest eligible historical path-start date (inclusive).
+                None starts with the first available close. Earlier prices,
+                when available, can still inform trailing indicator windows.
+            criteria:
+                One AsOfCriterion or FixedValueCriterion, a list/tuple of
+                ANDed criteria (one 'matched' variant), or a dictionary
+                mapping variant names to individual criteria/ANDed groups.
+                None defaults to as-of volatility(window=20, tolerance=0.25)
+                AND drawdown(window=126, tolerance=0.50); both use relative
+                tolerance. Each variant is evaluated independently.
+            sampling_step:
+                Positive trading-observation interval between CANDIDATE
+                start dates, starting at the first trading observation on
+                or after history_start. Default 1 evaluates every date.
+                Candidates are sampled BEFORE criteria matching, so larger
+                steps can miss brief matching periods. This reduces directly
+                overlapping starts but does not guarantee independence.
+
+        Returns:
+            ModelResults containing each variant's matched historical paths,
+            start_dates, indicator features and criteria metadata. Every
+            matching candidate is retained, including when sample counts are
+            small; zero matches yield status='no_matches' and empty paths.
+
+        Notes:
+            Path starts require a complete horizon_days forward window of
+            daily closing prices (the start close itself is excluded).
+            Each path is rescaled to the analysis reference_price.
+            history_start is also the anchor for sampling_step > 1; changing
+            it may change which dates are considered even in shared periods.
+            Paths may share future closes and are statistically dependent.
+            No minimum sample count or episode count is imposed.
         """
         if criteria is None:
             groups = {
@@ -1959,31 +1845,23 @@ class PriceTargetAnalysis:
             if not all(isinstance(c, (AsOfCriterion, FixedValueCriterion)) for c in group):
                 raise TypeError(f"{variant_name}: criteria must contain Criterion objects")
             normalized[variant_name] = group
+
         if (not isinstance(sampling_step, (int, np.integer))
                 or isinstance(sampling_step, (bool, np.bool_))
-                or sampling_step < 1 or min_samples < 1
-                or min_history_days < 2 or min_distinct_episodes < 1
-                or episode_gap_days < 0):
-            raise ValueError(
-                "sampling_step and minima must be positive; "
-                "min_history_days >=2, episode_gap_days >=0"
-            )
+                or sampling_step < 1):
+            raise ValueError("sampling_step must be a positive integer")
+
         n = len(self.close)
         latest_start = n - self.horizon_days - 1
         start_date = self._history_date(history_start)
         first = int(self.close.index.searchsorted(start_date))
         candidates = np.arange(first, latest_start + 1, sampling_step, dtype=int)
-        available_days = int((self.close.index >= start_date).sum())
         candidate_index = self.close.index[candidates]
         common_details = {
             "history_start": str(start_date.date()),
-            "min_samples": min_samples,
-            "min_history_days": min_history_days,
-            "min_distinct_episodes": min_distinct_episodes,
-            "episode_gap_days": episode_gap_days,
             "sampling_step": int(sampling_step),
             "candidate_count": len(candidates),
-            "available_history_days": available_days,
+            "available_history_days": int((self.close.index >= start_date).sum()),
             "first_candidate_start": (
                 str(candidate_index[0].date()) if len(candidate_index) else None
             ),
@@ -1996,13 +1874,6 @@ class PriceTargetAnalysis:
         steps = np.arange(1, self.horizon_days + 1)
         for variant_name, group in normalized.items():
             details = common_details.copy()
-            if available_days < min_history_days:
-                results[variant_name] = self._empty(
-                    variant_name,
-                    f"Need {min_history_days} history days, got {available_days}",
-                    **details,
-                )
-                continue
             if not len(candidates):
                 results[variant_name] = self._empty(
                     variant_name, "No completed historical forward windows", **details,
@@ -2060,7 +1931,8 @@ class PriceTargetAnalysis:
                     f"upper_bound_{key}": upper,
                 })
                 criterion_details.append({
-                    "indicator": name,
+                    "indicator": c.indicator,
+                    "window": c.window,
                     "reference_source": source,
                     "current": current,
                     "reference": reference,
@@ -2074,29 +1946,36 @@ class PriceTargetAnalysis:
             if warning is not None:
                 results[variant_name] = self._empty(variant_name, warning, **details)
                 continue
+
             selected = candidates[mask]
             matched_index = self.close.index[selected]
-            episodes = (
-                1 + int(np.sum(np.diff(selected) > episode_gap_days))
-                if len(selected) else 0
-            )
+            n_matched = len(selected)
+            nonoverlap = 0
+            last_selected = -self.horizon_days
+            for position in selected:
+                if nonoverlap == 0 or position >= last_selected + self.horizon_days:
+                    nonoverlap += 1
+                    last_selected = int(position)
+            year_counts = matched_index.year.value_counts() if n_matched else None
             details.update({
-                "matched_dates": len(selected),
-                "distinct_episodes": episodes,
+                "matched_dates": n_matched,
+                "nonoverlapping_paths": nonoverlap,
+                "max_year_share": (
+                    float(year_counts.max() / n_matched) if n_matched else np.nan
+                ),
                 "first_matched_start": (
-                    str(matched_index[0].date()) if len(selected) else None
+                    str(matched_index[0].date()) if n_matched else None
                 ),
                 "last_matched_start": (
-                    str(matched_index[-1].date()) if len(selected) else None
+                    str(matched_index[-1].date()) if n_matched else None
                 ),
             })
-            if len(selected) < min_samples or episodes < min_distinct_episodes:
-                reason = (
-                    f"Insufficient matches: {len(selected)} dates "
-                    f"(minimum {min_samples}), {episodes} episodes "
-                    f"(minimum {min_distinct_episodes})"
+            if not n_matched:
+                results[variant_name] = PathSample(
+                    variant_name, self.reference_price, self.horizon_days,
+                    np.empty((0, self.horizon_days)), details=details,
+                    status="no_matches", start_dates=matched_index,
                 )
-                results[variant_name] = self._empty(variant_name, reason, **details)
                 continue
             paths = (
                 self.reference_price * close[selected[:, None] + steps]
@@ -2280,7 +2159,7 @@ class ModelComparison:
                 "history_start", "simulations", "random_seed",
             ),
             "conditional_empirical": (
-                "history_start", "min_history_days",
+                "history_start",
             ),
         }
 
